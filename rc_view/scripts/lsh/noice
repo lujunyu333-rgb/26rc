@@ -1,0 +1,3 @@
+  start_kfs.sh
+- 无参数 → 默认只检测蓝色
+- 传参覆盖 → ./start_kfs.sh --ros-args -p target_color:=red 切红色， target_color:=both 切双色

@@ -1,0 +1,256 @@
+================================================================================
+   move_base_of_yolo 工作流程说明
+   基于 D435i + YOLO 的视觉伺服节点  |  ROS2  |  最后更新: 2026-06-29
+================================================================================
+
+
+一、系统概述
+────────────────────────────────────────────────────────────────────────────────
+
+这是一个 ROS2 节点，部署在机械臂/底盘上，连接 Intel RealSense D435i 深度相
+机。后台线程持续运行 YOLO 目标检测，主线程等待下位机发送校准请求，收到请求后
+根据偏差大小决定发偏移量还是发抓取信号。
+
+             D435i 相机
+                │
+   ┌────────────┼────────────┐
+   │ color  │ depth │ scale │ info │
+   ▼        ▼       ▼       ▼
+ ┌─────────────────────────────────┐
+ │       move_base_of_yolo         │
+ │                                 │
+ │  ┌── 后台推理线程 (daemon) ──┐  │
+ │  │ YOLO → 选目标 → 算偏移    │  │
+ │  │ → _latest_offset (px)     │  │
+ │  └───────────────────────────┘  │
+ │                                 │
+ │  ┌── 主线程 ─────────────────┐  │
+ │  │ 等待 request=1            │  │
+ │  │ → 死区判断 → 发信号        │  │
+ │  └───────────────────────────┘  │
+ └────────────┬────────────────────┘
+              │
+   ┌──────────┼──────────┐
+   │ y_offset │ grasp │ obstruction │
+   ▼          ▼       ▼
+        下位机
+
+
+二、数据流
+────────────────────────────────────────────────────────────────────────────────
+
+2.1  相机数据接收（主线程回调）
+
+  话题                             回调函数           写入变量
+  ────                             ────────           ────────
+  /camera/color/image_raw    →  _color_callback()  → color_frame (bgr8)
+  /camera/depth/image_raw    →  _depth_callback()  → depth_frame (16UC1)
+  /camera/depth/scale        →  _scale_callback()  → depth_scale
+  /camera/color/camera_info  →  _info_callback()   → camera_info (含 K 矩阵)
+
+
+2.2  后台推理线程 (_infer_loop, daemon)
+
+  每次 color_frame 更新后触发:
+
+  1. 拷贝 color_frame
+  2. 运行 YOLO 推理
+  3. 按 priority_class (默认 3) 筛选候选框
+     → 无 id=3 目标则回退到所有检测类别
+  4. 过滤: conf ≥ 0.50, 检测框面积 ≥ 500px, 裁剪到画面边界
+  5. 多目标时选框中心最靠近图像中心 (w/2, h/2) 的那个
+  6. _compute_y_offset(): 计算像素偏移量
+     offset_px = 图像中心X - 框中心X
+     左为正 (目标在画面左侧 → offset > 0)
+  7. 写入共享变量:
+     _latest_offset      ← offset_px
+     _latest_has_target  ← True/False
+     _latest_best_box    ← [x1,y1,x2,y2,conf,cls_id]
+
+
+三、校准请求流程（核心逻辑）
+────────────────────────────────────────────────────────────────────────────────
+
+3.1  触发条件
+
+  下位机发送 /camera/yolo/request  Int8 = 1
+
+
+3.2  执行步骤
+
+  Step 0: 检查抓取计数
+          如果 _grasp_count > max_grasp_count (默认 2):
+            → 拒绝请求，日志告警，节点退出
+
+  Step 1: 停止之前未完成的遮挡监测
+          取消 _obstruction_monitor_timer
+          重置 _obstruction_monitoring = False
+          重置 _obstruction_dark_start = None
+
+  Step 2: 读取最新推理结果
+          _latest_offset (px), _latest_has_target, _latest_best_box
+
+  Step 3: 像素 → 米 转换 (_pixel_to_world_offset)
+          输入: offset_px, best_box, depth_frame
+          过程:
+            1. 取框中心坐标 (box_cx, box_cy)
+            2. 读取该点深度: depth_raw = depth_frame[box_cy, box_cx]
+            3. depth_m = depth_raw × depth_scale
+            4. offset_m = offset_px × depth_m / fx
+          输出: offset_m (米, 左为正)
+
+  Step 4: 死区判断
+          in_dead_zone = |offset_m| ≤ dead_zone_m (默认 0.05m = 5cm)
+
+
+  ┌─ 分支 A: 目标偏离中心 (|offset_m| > 0.05m) ──────────────────────────┐
+  │                                                                      │
+  │  仅发布 /camera/yolo/y_offset  (Float32, offset_m 米)                 │
+  │                                                                      │
+  │  不发送 grasp                                                        │
+  │  不发送 obstruction                                                  │
+  │  不增加抓取计数                                                       │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ┌─ 分支 B: 目标在死区内 (|offset_m| ≤ 0.05m) ─────────────────────────┐
+  │                                                                      │
+  │  1. 立即发布 /camera/yolo/grasp  (Int8, data=1)                      │
+  │  2. 全局抓取计数 _grasp_count += 1                                    │
+  │  3. 启动遮挡监测定时器 @ 10Hz (_check_obstruction)                    │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+
+
+四、遮挡检测流程 (_check_obstruction, 10Hz)
+────────────────────────────────────────────────────────────────────────────────
+
+  grasp 发送后启动，每 0.1s 执行一次:
+
+  读取 color_frame → 转灰度图 → 计算平均亮度 mean_val
+
+  ┌─ mean_val < dark_threshold (默认 30): ──────────────────────────────┐
+  │                                                                     │
+  │  画面变黑 (相机被机械臂/夹爪遮挡)                                    │
+  │                                                                     │
+  │  首次变黑 → 记录 _obstruction_dark_start 时间戳                      │
+  │                                                                     │
+  │  持续变黑 ≥ obstruction_delay (默认 0.5s):                           │
+  │    → 发布 /camera/yolo/obstruction  (Int8, data=1)                  │
+  │    → 停止监测，销毁定时器                                            │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─ mean_val ≥ dark_threshold: ───────────────────────────────────────┐
+  │                                                                     │
+  │  画面恢复明亮 → 重置 _obstruction_dark_start (重新计时)             │
+  │                                                                     │
+  │  注意: 变黑必须是连续的。如果中途恢复明亮，计时归零。               │
+  │                                                                     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+
+五、话题一览
+────────────────────────────────────────────────────────────────────────────────
+
+  订阅
+  ────
+  话题                           类型                     说明
+  /camera/color/image_raw       sensor_msgs/Image        彩色图像
+  /camera/depth/image_raw       sensor_msgs/Image        深度图像 (16UC1)
+  /camera/depth/scale           std_msgs/Float32         深度缩放因子
+  /camera/color/camera_info     sensor_msgs/CameraInfo   相机内参 (K矩阵)
+  /camera/yolo/request          std_msgs/Int8            下位机校准请求 (1=校准)
+
+  发布
+  ────
+  话题                           类型                     说明
+  /camera/yolo/y_offset         std_msgs/Float32         水平偏移量 (米, 左为正)
+  /camera/yolo/grasp            std_msgs/Int8            抓取信号 (1=抓取)
+  /camera/yolo/obstruction      std_msgs/Int8            遮挡信号 (1=遮挡, 实际变黑后0.5s)
+
+
+六、默认参数
+────────────────────────────────────────────────────────────────────────────────
+
+  参数                   默认值   说明
+  ────                   ────     ────
+  model_path             *.pt     YOLO 模型路径
+  confidence_threshold   0.50     置信度下限
+  iou_threshold          0.45     NMS IoU 阈值
+  min_box_area           500      检测框最小面积 (px)
+  priority_class         3        优先跟踪的类别 ID
+  dead_zone_m            0.05     死区半径 (米)
+  dark_threshold         30       遮挡判定亮度阈值 (0-255)
+  obstruction_delay      0.5      遮挡确认延时 (秒)
+  max_grasp_count        2        最大抓取次数 (超过退出)
+
+
+七、线程模型
+────────────────────────────────────────────────────────────────────────────────
+
+  线程             职责                      同步方式
+  ────             ────                      ────────
+  主线程           相机订阅回调               threading.Lock (_frame_lock)
+                   校准请求回调               threading.Lock (_result_lock)
+                   遮挡监测 _check_obstruction
+  daemon线程       后台 YOLO 推理             threading.Event (_infer_ready)
+                                             threading.Event (_stop_event)
+  全局             抓取计数器                 threading.Lock (_grasp_count_lock)
+
+
+八、完整时序示例
+────────────────────────────────────────────────────────────────────────────────
+
+  场景: 目标偏离中心 → 下位机调整 → 目标居中 → 抓取 → 相机被遮挡
+
+  时间线
+  ──────
+
+  T0:     下位机发送 request=1
+          节点: offset_m = +0.12m > 0.05m (死区外)
+          节点: 发布 y_offset = +0.12 (目标偏左 12cm)
+          (不抓取, 不计数)
+
+  T1:     下位机收到 +0.12, 向右调整底盘, 再次发送 request=1
+          节点: offset_m = +0.08m > 0.05m (仍在死区外)
+          节点: 发布 y_offset = +0.08 (目标偏左 8cm)
+
+  T2:     下位机再调整, 又发 request=1
+          节点: offset_m = +0.02m ≤ 0.05m (在死区内!)
+          节点: 发布 grasp=1, 抓取计数=1
+          节点: 启动遮挡监测 @10Hz
+
+  T3:     机械臂抓取中, 遮挡相机
+          节点 (_check_obstruction): 检测到画面变黑, 开始计时
+
+  T3+0.5s: 画面持续变黑达 0.5s
+          节点: 发布 obstruction=1
+          节点: 停止遮挡监测
+
+  T4:     下位机收到 obstruction=1, 确认抓取完成
+          准备下一次抓取...
+
+  T5:     下位机再次发送 request=1 → 重复上述流程
+
+  ...     抓取计数 = 3 > max_grasp_count(2)
+          节点收到下一个 request=1 时自动退出
+
+
+九、关键设计决策
+────────────────────────────────────────────────────────────────────────────────
+
+  1. 死区判断在 request 回调中完成，单位米。
+     后台推理线程只计算像素偏移，不参与决策。
+
+  2. y_offset 仅在死区外发送。
+     死区内目标已居中，不需要偏移量，直接抓取。
+
+  3. obstruction 仅在画面实际变黑后才发送。
+     不是无脑延时 0.5s，而是 10Hz 轮询亮度，持续变黑 ≥0.5s 才确认。
+
+  4. 遮挡检测期间收到新 request 会取消当前监测。
+     防止旧监测干扰新一轮校准。
+
+  5. 抓取计数超过上限后，节点在收到下一个 request 时退出。
+     不是立即退出，给下位机缓冲。

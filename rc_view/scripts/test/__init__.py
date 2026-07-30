@@ -1,0 +1,1 @@
+# camera.scripts.test subpackage
