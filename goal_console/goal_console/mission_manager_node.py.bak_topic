@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+"""
+mission_manager_node — 比赛任务状态机节点
+
+状态机驱动，自主执行一区识别→抓取→对接→路线→三区动作 全流程。
+使用 Nav2 NavigateToPose action，所有动态目标基于 TF (map→base_link) 计算。
+
+订阅:
+  /camera1  std_msgs/Float32  — 一区视觉 y 偏移 (m)
+  /camera2  std_msgs/Int32    — 抓取完成信号 (10)
+  /camera3  std_msgs/Int32    — 对接完成 (2) / 路线选择 (31/32/33/34)
+  /camera4  std_msgs/Float32  — 三区视觉 y 偏移 (m)
+  /chassis_action_done  std_msgs/Int32 — 下位机动作完成 (1)
+
+发布:
+  /camera0  std_msgs/Int32    — 到达识别点 (1)
+  /chassis_action_cmd  std_msgs/Int32 — 下位机动作指令 (1)
+"""
+
+import math
+import os
+import sys
+import time
+from enum import IntEnum
+from typing import Optional
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
+
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Float32, Int32
+import tf2_ros
+from tf2_ros import TransformException
+import yaml
+
+
+# ---------------------------------------------------------------------------
+# 辅助函数
+# ---------------------------------------------------------------------------
+
+def normalize_angle(a: float) -> float:
+    """将角度归一化到 [-pi, pi]"""
+    a = math.fmod(a, 2.0 * math.pi)
+    if a > math.pi:
+        a -= 2.0 * math.pi
+    elif a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
+def yaw_to_quaternion(yaw: float):
+    """弧度 yaw → (qz, qw)"""
+    return (math.sin(yaw / 2.0), math.cos(yaw / 2.0))
+
+
+def quaternion_to_yaw(qz: float, qw: float) -> float:
+    """(qz, qw) → yaw (弧度)"""
+    siny_cosp = 2.0 * (qw * qz)
+    cosy_cosp = 1.0 - 2.0 * (qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
+
+
+def compute_dynamic_goal(current_x: float, current_y: float, current_yaw: float,
+                         dx: float, dy: float, dyaw: float):
+    """
+    根据当前 map 下位姿和 base_link 相对偏移，计算 map 坐标系下的目标位姿。
+
+    target_x = current_x + cos(yaw)*dx - sin(yaw)*dy
+    target_y = current_y + sin(yaw)*dx + cos(yaw)*dy
+    target_yaw = normalize(yaw + dyaw)
+    """
+    target_x = current_x + math.cos(current_yaw) * dx - math.sin(current_yaw) * dy
+    target_y = current_y + math.sin(current_yaw) * dx + math.cos(current_yaw) * dy
+    target_yaw = normalize_angle(current_yaw + dyaw)
+    return target_x, target_y, target_yaw
+
+
+def compute_goal_from_ref(ref_x: float, ref_y: float, ref_yaw: float,
+                          dx: float, dy: float, dyaw: float):
+    """
+    基于参考位姿（非当前位姿）和相对偏移计算目标位姿。
+    用于 last_camera1_goal + 0.2m 等场景。
+    """
+    target_x = ref_x + math.cos(ref_yaw) * dx - math.sin(ref_yaw) * dy
+    target_y = ref_y + math.sin(ref_yaw) * dx + math.cos(ref_yaw) * dy
+    target_yaw = normalize_angle(ref_yaw + dyaw)
+    return target_x, target_y, target_yaw
+
+
+# ---------------------------------------------------------------------------
+# 状态枚举
+# ---------------------------------------------------------------------------
+
+class State(IntEnum):
+    START = 0
+    GO_ZONE1_START = 1
+    PUBLISH_CAMERA0_START = 2
+    WAIT_CAMERA1_OFFSET = 3
+    MOVE_TO_CAMERA1_DYNAMIC_GOAL = 4
+    WAIT_CAMERA2_GRAB_DONE = 5
+    TURN_AROUND_DYNAMIC = 6
+    WAIT_CAMERA3_DOCK_DONE = 7
+    MOVE_TO_LAST_CAMERA1_GOAL_PLUS_0_2 = 8
+    RUN_FIXED_ROUTE = 9
+    ENTER_ZONE3 = 10
+    WAIT_CAMERA4_OFFSET = 11
+    MOVE_TO_ZONE3_DYNAMIC_GOAL = 12
+    PUBLISH_CHASSIS_ACTION_CMD = 13
+    WAIT_CHASSIS_ACTION_DONE = 14
+    TURN_AROUND_ZONE3 = 15
+    MOVE_FORWARD_0_5_DYNAMIC = 16
+    MISSION_DONE = 17
+    FAILED = 18
+
+
+STATE_NAMES = {v: k for k, v in State.__members__.items()}
+
+
+# ---------------------------------------------------------------------------
+# 主节点
+# ---------------------------------------------------------------------------
+
+class MissionManager(Node):
+    """比赛任务状态机节点"""
+
+    def __init__(self):
+        super().__init__('mission_manager')
+
+        # ==================== 参数声明 ====================
+        # 简单类型参数：声明 + 默认值
+        self.declare_parameter('selected_route_id', 1)
+        self.declare_parameter('zone1_continue_code', 2)
+        self.declare_parameter('zone1_finish_code', 3)
+        self.declare_parameter('route_select_mode', 'startup_param')
+        self.declare_parameter('camera2_turn_code', 10)
+        self.declare_parameter('zone1_return_local_y_offset', 0.2)
+        self.declare_parameter('zone3_forward_x_offset', 0.3)
+        self.declare_parameter('final_forward_x_offset', 0.5)
+        self.declare_parameter('max_vision_y_offset', 2.0)
+        self.declare_parameter('vision_timeout_sec', 5.0)
+        self.declare_parameter('action_timeout_sec', 10.0)
+        self.declare_parameter('frame_id', 'map')
+        self.declare_parameter('base_frame', 'base_link')
+        self.declare_parameter('action_name', '/navigate_to_pose')
+        self.declare_parameter('goal_tolerance', 0.3)
+
+        # 复杂类型参数（dict/list）：由 YAML 提供，直接 get_parameter 读取
+        self._zone1_start = self.get_parameter('zone1_start').value \
+            if self.has_parameter('zone1_start') else {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+        self._route_1 = self.get_parameter('route_1').value \
+            if self.has_parameter('route_1') else []
+        self._route_2 = self.get_parameter('route_2').value \
+            if self.has_parameter('route_2') else []
+        self._route_3 = self.get_parameter('route_3').value \
+            if self.has_parameter('route_3') else []
+        self._route_4 = self.get_parameter('route_4').value \
+            if self.has_parameter('route_4') else []
+
+        # 读取简单参数
+        self._selected_route_id = self.get_parameter('selected_route_id').value
+        self._zone1_continue_code = self.get_parameter('zone1_continue_code').value
+        self._zone1_finish_code = self.get_parameter('zone1_finish_code').value
+        self._route_select_mode = self.get_parameter('route_select_mode').value
+        self._camera2_turn_code = self.get_parameter('camera2_turn_code').value
+        self._zone1_return_local_y_offset = self.get_parameter('zone1_return_local_y_offset').value
+        self._zone3_forward_x_offset = self.get_parameter('zone3_forward_x_offset').value
+        self._final_forward_x_offset = self.get_parameter('final_forward_x_offset').value
+        self._max_vision_y_offset = self.get_parameter('max_vision_y_offset').value
+        self._vision_timeout_sec = self.get_parameter('vision_timeout_sec').value
+        self._action_timeout_sec = self.get_parameter('action_timeout_sec').value
+        self._frame_id = self.get_parameter('frame_id').value
+        self._base_frame = self.get_parameter('base_frame').value
+        self._action_name = self.get_parameter('action_name').value
+        self._goal_tolerance = self.get_parameter('goal_tolerance').value
+
+        # 校验 selected_route_id 合法性
+        if self._selected_route_id not in (1, 2, 3, 4):
+            self.get_logger().fatal(
+                f'selected_route_id = {self._selected_route_id}，无效！只能是 1/2/3/4')
+            raise ValueError(f'selected_route_id 无效: {self._selected_route_id}')
+
+        # 根据 selected_route_id 构建路线名→数据映射
+        self._route_map = {
+            1: ('route_1', self._route_1),
+            2: ('route_2', self._route_2),
+            3: ('route_3', self._route_3),
+            4: ('route_4', self._route_4),
+        }
+
+        # 校验必须参数
+        self._validate_params()
+
+        # ==================== 状态变量 ====================
+        self._state: State = State.START
+        self._state_entry_time: float = 0.0
+        self._last_camera1_goal: Optional[tuple] = None  # (x, y, yaw)
+        self._route_name: str = ''
+        self._selected_route: list = []
+        self._route_index: int = 0
+        self._zone1_cycle_count: int = 0
+
+        # 视觉数据缓存（仅在对应状态有效）
+        self._camera1_offset: Optional[float] = None
+        self._camera2_data: Optional[int] = None
+        self._camera3_data: Optional[int] = None
+        self._camera4_offset: Optional[float] = None
+        self._chassis_action_done_received: bool = False
+
+        # Nav2 action 状态
+        self._action_client: Optional[ActionClient] = None
+        self._goal_handle = None
+        self._goal_active: bool = False
+        self._goal_succeeded: bool = False
+        self._goal_failed: bool = False
+        self._goal_result_ready: bool = False
+
+        # ==================== 回调组 ====================
+        self._cb_group = MutuallyExclusiveCallbackGroup()
+
+        # ==================== 初始化组件 ====================
+        self._init_action_client()
+        self._init_tf()
+        self._init_publishers()
+        self._init_subscribers()
+
+        # ==================== 主循环定时器 (10Hz) ====================
+        self._timer = self.create_timer(0.1, self._state_machine_tick)
+
+        self.get_logger().info('mission_manager 已启动')
+        self.get_logger().info(f'  zone1_start: {self._zone1_start}')
+        self.get_logger().info(f'  路线选择模式: {self._route_select_mode}')
+        self.get_logger().info(f'  selected_route_id = {self._selected_route_id}')
+        self.get_logger().info(f'  selected_route_name = route_{self._selected_route_id}')
+        self.get_logger().info(f'  frame: {self._frame_id} → {self._base_frame}')
+
+    # =================================================================
+    # 参数校验
+    # =================================================================
+
+    def _validate_params(self):
+        """校验关键参数，缺失则报错"""
+        errors = []
+
+        # 校验 zone1_start
+        z1 = self._zone1_start
+        if not isinstance(z1, dict) or 'x' not in z1 or 'y' not in z1:
+            errors.append('zone1_start 格式错误，需要 {x, y, yaw} 字典')
+
+        # 校验路线参数
+        for route_name, route_data in [('route_1', self._route_1),
+                                        ('route_2', self._route_2),
+                                        ('route_3', self._route_3),
+                                        ('route_4', self._route_4)]:
+            if not route_data or len(route_data) == 0:
+                errors.append(f'{route_name} 未配置或为空，请在 mission_manager.yaml 中设置路线点')
+            elif not isinstance(route_data, list):
+                errors.append(f'{route_name} 格式错误，需要列表')
+            else:
+                for i, wp in enumerate(route_data):
+                    if not isinstance(wp, dict) or 'x' not in wp or 'y' not in wp:
+                        errors.append(f'{route_name}[{i}] 格式错误，需要 {{x, y, yaw}}')
+
+        if errors:
+            for e in errors:
+                self.get_logger().error(f'[PARAM ERROR] {e}')
+            # 不 raise，允许启动但会在进入对应状态时报错
+
+    # =================================================================
+    # 初始化
+    # =================================================================
+
+    def _init_action_client(self):
+        self._action_client = ActionClient(self, NavigateToPose, self._action_name)
+
+    def _init_tf(self):
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+    def _init_publishers(self):
+        self._camera0_pub = self.create_publisher(Int32, '/camera0', 10)
+        self._chassis_action_cmd_pub = self.create_publisher(Int32, '/chassis_action_cmd', 10)
+
+    def _init_subscribers(self):
+        self._camera1_sub = self.create_subscription(
+            Float32, '/camera1',
+            self._camera1_callback, 10,
+            callback_group=self._cb_group)
+        self._camera2_sub = self.create_subscription(
+            Int32, '/camera2',
+            self._camera2_callback, 10,
+            callback_group=self._cb_group)
+        self._camera3_sub = self.create_subscription(
+            Int32, '/camera3',
+            self._camera3_callback, 10,
+            callback_group=self._cb_group)
+        self._camera4_sub = self.create_subscription(
+            Float32, '/camera4',
+            self._camera4_callback, 10,
+            callback_group=self._cb_group)
+        self._chassis_action_done_sub = self.create_subscription(
+            Int32, '/chassis_action_done',
+            self._chassis_action_done_callback, 10,
+            callback_group=self._cb_group)
+
+    # =================================================================
+    # Topic 回调
+    # =================================================================
+
+    def _camera1_callback(self, msg: Float32):
+        if self._state == State.WAIT_CAMERA1_OFFSET:
+            offset = float(msg.data)
+            offset = max(-self._max_vision_y_offset, min(self._max_vision_y_offset, offset))
+            # 限幅后只取负方向（y_offset 可能为正或负，但用户说只发 y 负方向用于向右平移）
+            self._camera1_offset = offset
+            self.get_logger().info(f'[CAMERA1] 收到偏移: {offset:.3f}m (已限幅 ±{self._max_vision_y_offset:.1f})')
+
+    def _camera2_callback(self, msg: Int32):
+        if self._state == State.WAIT_CAMERA2_GRAB_DONE:
+            self._camera2_data = int(msg.data)
+            self.get_logger().info(f'[CAMERA2] 收到数据: {self._camera2_data}')
+
+    def _camera3_callback(self, msg: Int32):
+        if self._state == State.WAIT_CAMERA3_DOCK_DONE:
+            self._camera3_data = int(msg.data)
+            self.get_logger().info(f'[CAMERA3] 收到数据: {self._camera3_data}')
+
+    def _camera4_callback(self, msg: Float32):
+        if self._state == State.WAIT_CAMERA4_OFFSET:
+            offset = float(msg.data)
+            offset = max(-self._max_vision_y_offset, min(self._max_vision_y_offset, offset))
+            self._camera4_offset = offset
+            self.get_logger().info(f'[CAMERA4] 收到偏移: {offset:.3f}m')
+
+    def _chassis_action_done_callback(self, msg: Int32):
+        if self._state == State.WAIT_CHASSIS_ACTION_DONE and int(msg.data) == 1:
+            self._chassis_action_done_received = True
+            self.get_logger().info('[CHASSIS] 动作完成信号收到')
+
+    # =================================================================
+    # TF 查询
+    # =================================================================
+
+    def _get_current_pose(self) -> Optional[tuple]:
+        """返回 (x, y, yaw) 或 None"""
+        try:
+            if not self._tf_buffer.can_transform(
+                self._frame_id, self._base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=2.0),
+            ):
+                return None
+            t = self._tf_buffer.lookup_transform(
+                self._frame_id, self._base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=2.0),
+            )
+            x = t.transform.translation.x
+            y = t.transform.translation.y
+            qz = t.transform.rotation.z
+            qw = t.transform.rotation.w
+            yaw = quaternion_to_yaw(qz, qw)
+            return (x, y, yaw)
+        except TransformException as e:
+            self.get_logger().warn(f'TF 查询失败: {e}')
+            return None
+
+    # =================================================================
+    # Nav2 Action 操作
+    # =================================================================
+
+    def _cancel_current_goal(self):
+        """取消当前导航目标"""
+        if self._goal_handle is not None:
+            self.get_logger().info('取消当前导航目标...')
+            try:
+                self._goal_handle.cancel_goal_async()
+            except Exception as e:
+                self.get_logger().warn(f'取消失败: {e}')
+        self._reset_goal_state()
+
+    def _reset_goal_state(self):
+        self._goal_handle = None
+        self._goal_active = False
+        self._goal_succeeded = False
+        self._goal_failed = False
+        self._goal_result_ready = False
+
+    def _send_nav_goal(self, target_x: float, target_y: float, target_yaw: float):
+        """发送 NavigateToPose 目标"""
+        if not self._action_client.server_is_ready():
+            self.get_logger().error(f'Action server {self._action_name} 不可用')
+            self._goal_failed = True
+            self._goal_result_ready = True
+            return
+
+        self._cancel_current_goal()
+
+        qz, qw = yaw_to_quaternion(target_yaw)
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = self._frame_id
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = float(target_x)
+        goal_msg.pose.pose.position.y = float(target_y)
+        goal_msg.pose.pose.position.z = 0.0
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
+        goal_msg.pose.pose.orientation.z = qz
+        goal_msg.pose.pose.orientation.w = qw
+
+        self._goal_active = True
+        self._goal_succeeded = False
+        self._goal_failed = False
+        self._goal_result_ready = False
+
+        self.get_logger().info(
+            f'发送目标: x={target_x:.3f}, y={target_y:.3f}, yaw={target_yaw:.3f} rad')
+
+        send_future = self._action_client.send_goal_async(goal_msg)
+        send_future.add_done_callback(self._goal_response_callback)
+
+    def _goal_response_callback(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error('目标被 Nav2 拒绝')
+            self._goal_active = False
+            self._goal_failed = True
+            self._goal_result_ready = True
+            return
+
+        self.get_logger().info('Nav2 已接受目标')
+        self._goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._goal_result_callback)
+
+    def _goal_result_callback(self, future):
+        result = future.result()
+        status = result.status
+
+        self._goal_handle = None
+        self._goal_active = False
+        self._goal_result_ready = True
+
+        if status == 4:  # SUCCEEDED
+            self.get_logger().info('目标已到达')
+            self._goal_succeeded = True
+            self._goal_failed = False
+        elif status == 5:  # CANCELED
+            self.get_logger().info('目标已取消')
+            self._goal_succeeded = False
+            self._goal_failed = True
+        elif status == 6:  # ABORTED
+            self.get_logger().error('目标被 Nav2 中止')
+            self._goal_succeeded = False
+            self._goal_failed = True
+        else:
+            self.get_logger().warn(f'目标结果: status={status}')
+            self._goal_succeeded = False
+            self._goal_failed = True
+
+    # =================================================================
+    # 状态切换
+    # =================================================================
+
+    def _transition_to(self, new_state: State):
+        old_name = STATE_NAMES.get(self._state, '?')
+        new_name = STATE_NAMES.get(new_state, '?')
+        self.get_logger().info(f'[状态] {old_name} → {new_name}')
+        self._state = new_state
+        self._state_entry_time = time.time()
+        self._goal_result_ready = False
+
+    def _time_in_state(self) -> float:
+        return time.time() - self._state_entry_time
+
+    # =================================================================
+    # 主循环
+    # =================================================================
+
+    def _state_machine_tick(self):
+        """10Hz 主循环，根据当前状态执行对应逻辑"""
+        try:
+            if self._state == State.START:
+                self._handle_start()
+            elif self._state == State.GO_ZONE1_START:
+                self._handle_go_zone1_start()
+            elif self._state == State.PUBLISH_CAMERA0_START:
+                self._handle_publish_camera0_start()
+            elif self._state == State.WAIT_CAMERA1_OFFSET:
+                self._handle_wait_camera1_offset()
+            elif self._state == State.MOVE_TO_CAMERA1_DYNAMIC_GOAL:
+                self._handle_move_to_camera1_dynamic_goal()
+            elif self._state == State.WAIT_CAMERA2_GRAB_DONE:
+                self._handle_wait_camera2_grab_done()
+            elif self._state == State.TURN_AROUND_DYNAMIC:
+                self._handle_turn_around_dynamic()
+            elif self._state == State.WAIT_CAMERA3_DOCK_DONE:
+                self._handle_wait_camera3_dock_done()
+            elif self._state == State.MOVE_TO_LAST_CAMERA1_GOAL_PLUS_0_2:
+                self._handle_move_last_camera1_plus_02()
+            elif self._state == State.RUN_FIXED_ROUTE:
+                self._handle_run_fixed_route()
+            elif self._state == State.ENTER_ZONE3:
+                self._handle_enter_zone3()
+            elif self._state == State.WAIT_CAMERA4_OFFSET:
+                self._handle_wait_camera4_offset()
+            elif self._state == State.MOVE_TO_ZONE3_DYNAMIC_GOAL:
+                self._handle_move_zone3_dynamic_goal()
+            elif self._state == State.PUBLISH_CHASSIS_ACTION_CMD:
+                self._handle_publish_chassis_action_cmd()
+            elif self._state == State.WAIT_CHASSIS_ACTION_DONE:
+                self._handle_wait_chassis_action_done()
+            elif self._state == State.TURN_AROUND_ZONE3:
+                self._handle_turn_around_zone3()
+            elif self._state == State.MOVE_FORWARD_0_5_DYNAMIC:
+                self._handle_move_forward_05()
+            elif self._state == State.MISSION_DONE:
+                pass  # 完成，不再动作
+            elif self._state == State.FAILED:
+                pass  # 失败，停止
+        except Exception as e:
+            self.get_logger().error(f'状态机异常: {e}', exc_info=True)
+            self._transition_to(State.FAILED)
+
+    # =================================================================
+    # 各状态处理函数
+    # =================================================================
+
+    def _handle_start(self):
+        """START → GO_ZONE1_START"""
+        self.get_logger().info('任务启动，前往 zone1_start')
+        self._transition_to(State.GO_ZONE1_START)
+
+    def _handle_go_zone1_start(self):
+        """导航到 zone1_start → PUBLISH_CAMERA0_START"""
+        if not self._goal_active and not self._goal_result_ready:
+            # 进入状态：发送目标
+            z1 = self._zone1_start
+            self._send_nav_goal(float(z1['x']), float(z1['y']), float(z1.get('yaw', 0.0)))
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self._transition_to(State.PUBLISH_CAMERA0_START)
+            else:
+                self.get_logger().error('前往 zone1_start 失败')
+                self._transition_to(State.FAILED)
+
+    def _publish_camera0_triple(self):
+        """连续发布 3 次 /camera0 = 1，间隔 0.1s，避免视觉节点漏收"""
+        for i in range(3):
+            msg = Int32()
+            msg.data = 1
+            self._camera0_pub.publish(msg)
+            self.get_logger().info(f'发布 /camera0 = 1 ({i + 1}/3)')
+            if i < 2:
+                time.sleep(0.1)
+
+    def _handle_publish_camera0_start(self):
+        """发布 /camera0 = 1 (三连发) → WAIT_CAMERA1_OFFSET"""
+        self._publish_camera0_triple()
+        self._camera1_offset = None
+        self._transition_to(State.WAIT_CAMERA1_OFFSET)
+
+    def _handle_wait_camera1_offset(self):
+        """等待 /camera1 → MOVE_TO_CAMERA1_DYNAMIC_GOAL 或 FAILED"""
+        if self._camera1_offset is not None:
+            self._transition_to(State.MOVE_TO_CAMERA1_DYNAMIC_GOAL)
+        elif self._time_in_state() > self._vision_timeout_sec:
+            self.get_logger().warn(f'等待 /camera1 超时 ({self._vision_timeout_sec}s)')
+            self._transition_to(State.FAILED)
+
+    def _handle_move_to_camera1_dynamic_goal(self):
+        """基于 /camera1 y_offset 移动 → WAIT_CAMERA2_GRAB_DONE"""
+        if not self._goal_active and not self._goal_result_ready:
+            pose = self._get_current_pose()
+            if pose is None:
+                self.get_logger().error('无法获取当前位姿')
+                self._transition_to(State.FAILED)
+                return
+            cx, cy, cyaw = pose
+            offset = self._camera1_offset
+            tx, ty, tyaw = compute_dynamic_goal(cx, cy, cyaw, dx=0.0, dy=offset, dyaw=0.0)
+            self._last_camera1_goal = (tx, ty, tyaw)
+            self.get_logger().info(f'动态目标 (camera1): dy={offset:.3f}m → map({tx:.3f}, {ty:.3f})')
+            self._send_nav_goal(tx, ty, tyaw)
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self._camera2_data = None
+                self._transition_to(State.WAIT_CAMERA2_GRAB_DONE)
+            else:
+                self.get_logger().error('动态目标导航失败')
+                self._transition_to(State.FAILED)
+
+    def _handle_wait_camera2_grab_done(self):
+        """等待 /camera2 = 10 → TURN_AROUND_DYNAMIC"""
+        if self._camera2_data == self._camera2_turn_code:
+            self._transition_to(State.TURN_AROUND_DYNAMIC)
+        elif self._time_in_state() > self._vision_timeout_sec:
+            self.get_logger().warn(f'等待 /camera2 超时')
+            self._transition_to(State.FAILED)
+
+    def _handle_turn_around_dynamic(self):
+        """原地转身 180° → WAIT_CAMERA3_DOCK_DONE"""
+        if not self._goal_active and not self._goal_result_ready:
+            pose = self._get_current_pose()
+            if pose is None:
+                self._transition_to(State.FAILED)
+                return
+            cx, cy, cyaw = pose
+            tyaw = normalize_angle(cyaw + math.pi)
+            self.get_logger().info(f'原地转身 180°: 保持 ({cx:.3f}, {cy:.3f}), yaw {cyaw:.3f} → {tyaw:.3f}')
+            self._send_nav_goal(cx, cy, tyaw)
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self._camera3_data = None
+                self._transition_to(State.WAIT_CAMERA3_DOCK_DONE)
+            else:
+                self.get_logger().error('转身失败')
+                self._transition_to(State.FAILED)
+
+    def _handle_wait_camera3_dock_done(self):
+        """等待 /camera3 → MOVE_TO_LAST_CAMERA1_GOAL_PLUS_0_2 或 RUN_FIXED_ROUTE"""
+        if self._camera3_data is None:
+            if self._time_in_state() > self._vision_timeout_sec:
+                self.get_logger().warn('等待 /camera3 超时')
+                self._transition_to(State.FAILED)
+            return
+
+        code = self._camera3_data
+        if code == self._zone1_continue_code:
+            # code=2: 对接完成，继续一区下一轮识别
+            self._zone1_cycle_count += 1
+            self.get_logger().info(f'一区继续 (第 {self._zone1_cycle_count} 次循环)')
+            self._transition_to(State.MOVE_TO_LAST_CAMERA1_GOAL_PLUS_0_2)
+        elif code == self._zone1_finish_code:
+            # code=3: 一区结束，执行启动时预选的路线
+            self._route_name, self._selected_route = self._route_map[self._selected_route_id]
+            self._route_index = 0
+            self._zone1_cycle_count = 0
+            if not self._selected_route or len(self._selected_route) == 0:
+                self.get_logger().error(
+                    f'{self._route_name} 未配置或为空，请在 mission_manager.yaml 中设置路线点')
+                self._transition_to(State.FAILED)
+                return
+            self.get_logger().info(
+                f'camera3=3, zone1 finished, running selected {self._route_name} '
+                f'(共 {len(self._selected_route)} 个点)')
+            self._transition_to(State.RUN_FIXED_ROUTE)
+        else:
+            self.get_logger().warn(f'未知 camera3 code: {code}，忽略')
+
+    def _handle_move_last_camera1_plus_02(self):
+        """基于 last_camera1_goal +0.2m (局部y) → PUBLISH_CAMERA0_START"""
+        if self._last_camera1_goal is None:
+            self.get_logger().error('last_camera1_goal 为空')
+            self._transition_to(State.FAILED)
+            return
+
+        if not self._goal_active and not self._goal_result_ready:
+            lx, ly, lyaw = self._last_camera1_goal
+            tx, ty, tyaw = compute_goal_from_ref(
+                lx, ly, lyaw,
+                dx=0.0, dy=self._zone1_return_local_y_offset, dyaw=0.0)
+            self.get_logger().info(f'返回 last_camera1_goal+0.2: map({tx:.3f}, {ty:.3f})')
+            self._send_nav_goal(tx, ty, tyaw)
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self._transition_to(State.PUBLISH_CAMERA0_START)
+            else:
+                self.get_logger().error('返回 last_camera1_goal 失败')
+                self._transition_to(State.FAILED)
+
+    def _handle_run_fixed_route(self):
+        """运行固定路线 → ENTER_ZONE3"""
+
+        # 检查是否所有点都已执行
+        if self._route_index >= len(self._selected_route):
+            self.get_logger().info('路线完成，进入三区')
+            self._route_index = 0
+            self._transition_to(State.ENTER_ZONE3)
+            return
+
+        # 发送当前点
+        if not self._goal_active and not self._goal_result_ready:
+            wp = self._selected_route[self._route_index]
+            self.get_logger().info(f'路线点 [{self._route_index + 1}/{len(self._selected_route)}]: '
+                                   f'({wp["x"]:.3f}, {wp["y"]:.3f}, yaw={wp.get("yaw", 0):.3f})')
+            self._send_nav_goal(float(wp['x']), float(wp['y']), float(wp.get('yaw', 0.0)))
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self._route_index += 1
+                self._goal_result_ready = False
+            else:
+                self.get_logger().error(f'路线点 [{self._route_index + 1}] 失败')
+                self._transition_to(State.FAILED)
+
+    def _handle_enter_zone3(self):
+        """进入三区 → WAIT_CAMERA4_OFFSET"""
+        self.get_logger().info('进入三区')
+        self._camera4_offset = None
+        self._transition_to(State.WAIT_CAMERA4_OFFSET)
+
+    def _handle_wait_camera4_offset(self):
+        """等待 /camera4 → MOVE_TO_ZONE3_DYNAMIC_GOAL"""
+        if self._camera4_offset is not None:
+            self._transition_to(State.MOVE_TO_ZONE3_DYNAMIC_GOAL)
+        elif self._time_in_state() > self._vision_timeout_sec:
+            self.get_logger().warn(f'等待 /camera4 超时')
+            self._transition_to(State.FAILED)
+
+    def _handle_move_zone3_dynamic_goal(self):
+        """基于 /camera4 y_offset 移动 → PUBLISH_CHASSIS_ACTION_CMD"""
+        if not self._goal_active and not self._goal_result_ready:
+            pose = self._get_current_pose()
+            if pose is None:
+                self._transition_to(State.FAILED)
+                return
+            cx, cy, cyaw = pose
+            offset = self._camera4_offset
+            tx, ty, tyaw = compute_dynamic_goal(
+                cx, cy, cyaw, dx=self._zone3_forward_x_offset, dy=offset, dyaw=0.0)
+            self.get_logger().info(f'三区动态目标: dx=+{self._zone3_forward_x_offset:.1f}, '
+                                   f'dy={offset:.3f} → map({tx:.3f}, {ty:.3f})')
+            self._send_nav_goal(tx, ty, tyaw)
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self._transition_to(State.PUBLISH_CHASSIS_ACTION_CMD)
+            else:
+                self.get_logger().error('三区动态目标失败')
+                self._transition_to(State.FAILED)
+
+    def _handle_publish_chassis_action_cmd(self):
+        """发布 /chassis_action_cmd = 1 → WAIT_CHASSIS_ACTION_DONE"""
+        msg = Int32()
+        msg.data = 1
+        self._chassis_action_cmd_pub.publish(msg)
+        self.get_logger().info('发布 /chassis_action_cmd = 1')
+        self._chassis_action_done_received = False
+        self._transition_to(State.WAIT_CHASSIS_ACTION_DONE)
+
+    def _handle_wait_chassis_action_done(self):
+        """等待 /chassis_action_done = 1 → TURN_AROUND_ZONE3"""
+        if self._chassis_action_done_received:
+            self._transition_to(State.TURN_AROUND_ZONE3)
+        elif self._time_in_state() > self._action_timeout_sec:
+            self.get_logger().warn(f'等待 chassis_action_done 超时')
+            self._transition_to(State.FAILED)
+
+    def _handle_turn_around_zone3(self):
+        """原地转身 180° → MOVE_FORWARD_0_5_DYNAMIC"""
+        if not self._goal_active and not self._goal_result_ready:
+            pose = self._get_current_pose()
+            if pose is None:
+                self._transition_to(State.FAILED)
+                return
+            cx, cy, cyaw = pose
+            tyaw = normalize_angle(cyaw + math.pi)
+            self.get_logger().info(f'三区转身 180°: 保持 ({cx:.3f}, {cy:.3f}), yaw {cyaw:.3f} → {tyaw:.3f}')
+            self._send_nav_goal(cx, cy, tyaw)
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self._transition_to(State.MOVE_FORWARD_0_5_DYNAMIC)
+            else:
+                self.get_logger().error('三区转身失败')
+                self._transition_to(State.FAILED)
+
+    def _handle_move_forward_05(self):
+        """前进 0.5m → MISSION_DONE"""
+        if not self._goal_active and not self._goal_result_ready:
+            pose = self._get_current_pose()
+            if pose is None:
+                self._transition_to(State.FAILED)
+                return
+            cx, cy, cyaw = pose
+            tx, ty, tyaw = compute_dynamic_goal(
+                cx, cy, cyaw, dx=self._final_forward_x_offset, dy=0.0, dyaw=0.0)
+            self.get_logger().info(f'最后前进 {self._final_forward_x_offset:.1f}m: '
+                                   f'map({tx:.3f}, {ty:.3f})')
+            self._send_nav_goal(tx, ty, tyaw)
+        elif self._goal_result_ready:
+            if self._goal_succeeded:
+                self.get_logger().info('===== MISSION COMPLETE =====')
+                self._transition_to(State.MISSION_DONE)
+            else:
+                self.get_logger().error('最后前进失败')
+                self._transition_to(State.FAILED)
+
+
+# ---------------------------------------------------------------------------
+# 入口
+# ---------------------------------------------------------------------------
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = MissionManager()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info('用户中断')
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

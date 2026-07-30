@@ -1,0 +1,23 @@
+routes:
+  - name: blue_mission
+    points:
+      - blue1
+      - blue2
+      - blue3
+      - blue4
+      - blue5
+      - blue6
+      - blue7
+      - blue8
+      - blue9
+  - name: route_2
+    points:
+      - blue1
+      - blue2
+      - blue3
+      - blue4
+      - blue5
+      - blue6
+      - blue7
+      - blue8
+      - blue9

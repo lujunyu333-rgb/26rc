@@ -1,0 +1,105 @@
+mission_manager:
+  ros__parameters:
+    # ============================
+    # zone1_start — 一区起始识别点（map 坐标），格式 [x, y, yaw]
+    # 按阵营分别配置
+    # ============================
+    zone1_start_blue: [0.36, -4.605, -1.5882]
+    zone1_start_red_configured: true
+    zone1_start_red: [-0.24, -6.03, 1.5882]
+    zone1_start: [0.36, -4.605, -1.5882]           # 兼容旧配置（默认蓝方）
+
+    # ============================
+    # 四套固定路线（每条路线是一组 map 坐标点，按顺序执行）
+    # 格式: [{x, y, yaw}, ...]
+    # 如果未填写实际坐标，启动时会报错。
+    # ============================
+    route_1: []
+    route_2: [
+      1.1955, -2.2311,  0.0118,
+      2.7397, -2.2391, -0.0054,
+      3.8799, -2.2690, -0.0060,
+      5.0667, -2.2804, -0.0268,
+      6.2469, -2.3562,  1.5564,
+      6.2758, -1.1165,  1.5728,
+      6.3926,  0.0860, -0.0235,
+      9.7384, -2.6664, -1.5724
+    ]
+    route_3: []
+    route_4: []
+
+    # ============================
+    # 一区真实 topic
+    # ============================
+    camera_start_topic: "/camera/yolo/request"     # 导航→视觉：已到达，可以识别
+    zone1_offset_topic: "/camera/yolo/y_offset"     # 视觉→导航：y 偏移 (m)，左正右负
+    grab_done_topic: "/camera/view_sig"             # 视觉→导航：抓取完成，需要转身
+    dock_done_topic: "/camera/qr_flag"               # 视觉→导航：对接完成 / 一区结束
+
+    # ============================
+    # 协议码配置
+    # ============================
+    route_select_mode: "startup_param"
+    selected_route_id: 1                     # 启动时选定路线 (1/2/3/4)
+    camera_start_code: 1                     # camera_start_topic=1 → 到达识别点
+    grab_done_code: 1                        # grab_done_topic=1 → 抓取完成，转身
+    zone1_continue_code: 2                   # dock_done_topic=2 → 继续一区下一轮识别
+    zone1_finish_code: 3                     # dock_done_topic=3 → 一区结束，执行选定的路线
+
+    # ============================
+    # 几何偏移参数 (m)
+    # ============================
+    # /camera/view_cmd data=2 后继续一区：
+    # 基于 last_camera1_goal 沿 map X 方向偏移。
+    # 当前 -0.20 表示 map X 负方向 20cm。
+    zone1_continue_map_x_offset: -0.20
+    zone3_forward_x_offset: 0.3        # 三区 dx 偏移
+    final_forward_x_offset: 0.5        # 最后前进距离
+
+    # ============================
+    # 安全限幅
+    # ============================
+    max_vision_y_offset: 2.0           # 视觉 y 偏移上限 (m)
+
+    # ============================
+    # 工作台联调模式
+    # ============================
+    bench_test_mode: false          # true=跳过 zone1_start，直接进入视觉偏移等待
+    dry_run_nav: false              # true=只打印目标点，不发送 NavigateToPose
+    route_arrive_then_rotate: true  # true=路线点先到 x/y 再原地转向；false=直接一起到
+    route_only_mode: false          # true=跳过一区，直接执行 selected_route_id 路线
+    zone2_executor: "grid_gui"      # "grid_gui"=发布/zone2_grid/start → GUI 执行; "route"=旧 RUN_FIXED_ROUTE
+    zone2_grid_done_timeout_sec: 60.0 # 等待 GUI /zone2_grid/done 的超时 (s)
+    bench_timeout_sec: 60.0         # 工作台模式下视觉信号等待超时 (s)
+
+    # ============================
+    # RViz debug 可视化
+    # ============================
+    enable_debug_visualization: true
+    debug_goal_topic: "/mission_manager/debug_goal"
+    debug_marker_topic: "/mission_manager/debug_marker"
+
+    # ============================
+    # 转身闭环控制参数
+    # ============================
+    turn_cmd_topic: "/cmd_vel_nav"
+    turn_kp: 1.0
+    turn_max_wz: 0.8
+    turn_min_wz: 0.1
+    turn_yaw_tolerance: 0.05
+    turn_timeout_sec: 15.0
+    turn_direction: -1               # -1=顺时针, +1=逆时针
+
+    # ============================
+    # 超时参数 (s)
+    # ============================
+    vision_timeout_sec: 60.0           # 等待视觉信号的超时
+    action_timeout_sec: 10.0           # 等待下位机动作完成的超时
+
+    # ============================
+    # 坐标系
+    # ============================
+    frame_id: "map"
+    base_frame: "base_link"
+    action_name: "/navigate_to_pose"
+    goal_tolerance: 0.05

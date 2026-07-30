@@ -1,0 +1,20 @@
+# Z2 第二比赛参数
+# 由 z2.sh 传入 startup_pose_manager 和 z2_mission_manager
+
+# ========== startup_pose_manager 参数 ==========
+startup_pose_manager:
+  ros__parameters:
+    startup_blue: [6.1999, -0.0241, 0.0]
+    startup_red: [6.1999, -10.5600, -0.008]
+
+# ========== z2_mission_manager 参数 ==========
+z2_mission_manager:
+  ros__parameters:
+    first_goal_blue: [9.6215, -3.1194, -1.5741]
+    second_goal_blue: [9.6215, -3.7194, -1.5741]
+    first_goal_red: [9.6215, -8.1194, 1.5741]
+    second_goal_red: [9.6215, -7.5194, 1.5741]
+    blue_dynamic_map_y_delta: -2.67
+    red_dynamic_map_y_delta: 2.67
+    nine_grid_request_value: 1
+    stair_action_value: 3

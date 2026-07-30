@@ -1,0 +1,54 @@
+mission_manager:
+  ros__parameters:
+    # ============================
+    # zone1_start — 一区起始识别点（map 坐标）
+    # ============================
+    zone1_start:
+      x: 0.3060
+      y: -4.5711
+      yaw: -1.5708
+
+    # ============================
+    # 四套固定路线（每条路线是一组 map 坐标点，按顺序执行）
+    # 格式: [{x, y, yaw}, ...]
+    # 如果未填写实际坐标，启动时会报错。
+    # ============================
+    route_1: []
+    route_2: []
+    route_3: []
+    route_4: []
+
+    # ============================
+    # 协议码配置
+    # ============================
+    route_select_mode: "startup_param"
+    selected_route_id: 1                      # 启动时选定路线 (1/2/3/4)
+    zone1_continue_code: 2                    # camera3=2 → 继续一区下一轮识别
+    zone1_finish_code: 3                      # camera3=3 → 一区结束，执行选定的路线
+    camera2_turn_code: 10                     # camera2=10 → 转身
+
+    # ============================
+    # 几何偏移参数 (m)
+    # ============================
+    zone1_return_local_y_offset: 0.2   # 继续识别时在 last_camera1_goal 的局部 +y 偏移
+    zone3_forward_x_offset: 0.3        # 三区 dx 偏移
+    final_forward_x_offset: 0.5        # 最后前进距离
+
+    # ============================
+    # 安全限幅
+    # ============================
+    max_vision_y_offset: 2.0           # 视觉 y 偏移上限 (m)
+
+    # ============================
+    # 超时参数 (s)
+    # ============================
+    vision_timeout_sec: 5.0            # 等待视觉信号的超时
+    action_timeout_sec: 10.0           # 等待下位机动作完成的超时
+
+    # ============================
+    # 坐标系
+    # ============================
+    frame_id: "map"
+    base_frame: "base_link"
+    action_name: "/navigate_to_pose"
+    goal_tolerance: 0.3
