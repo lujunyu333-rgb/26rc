@@ -1,0 +1,187 @@
+# 0. ROS2 参数配置
+serial_controller:
+  ros__parameters:
+    port: "/dev/serial/by-id/usb-STMicroelectronics_STM32_Virtual_ComPort_306C358C3034-if00"
+    baudrate: 460800
+    timeout: 0.1
+    reconnect_enabled: true
+    reconnect_interval_ms: 1000
+    log_throttle_ms: 5000
+    send_pose_to_mcu: true
+    pose_send_rate: 20.0
+    pose_packet_id: 18
+    pose_map_frame: "map"
+    pose_base_frame: "base_link"
+
+# 1. 全局配置
+config:
+  baudrate: 460800
+  buffer_size: 256
+  head_byte_1: 0x5A
+  head_byte_2: 0xA5
+  checksum: "CRC8"
+
+  # 调试阶段先关闭握手和心跳，避免电控端还没集成协议时卡住
+  require_handshake: false
+  ignore_version_mismatch: false
+  enable_heartbeat: false
+  strict_heartbeat: false
+
+  reliable_retry_interval_ms: 100
+  reliable_max_retries: 3
+  qos_depth: 10
+  heartbeat_timeout_ms: 0
+
+# 2. 类型映射
+type_mappings:
+  f32: "float"
+  i32: "int32_t"
+  u8:  "uint8_t"
+  u16: "uint16_t"
+  u32: "uint32_t"
+
+messages:
+
+  # ============================================================
+  # 系统消息
+  # 如果 require_handshake=false 且 enable_heartbeat=false，
+  # 这些系统消息暂时不会影响你直接发送 CmdVel。
+  # 保留它们，后面要恢复握手/心跳时不用重写协议。
+  # ============================================================
+
+  - name: "Ack"
+    id: 0xFD
+    direction: "both"
+    debug_log_mode: "on_change"
+    sub_topic: "/task/ack"
+    pub_topic: "/task/ack"
+    ros_msg: "std_msgs/msg/Int32MultiArray"
+    notes: "通用 ACK。acked_id 为被确认包的原始 Packet ID，ack_seq 为发送方附加的序列号。"
+    fields:
+      - { proto: "acked_id", type: "u8", ros: "data[0]" }
+      - { proto: "ack_seq",  type: "u8", ros: "data[1]" }
+
+  - name: "Heartbeat"
+    id: 0xFE
+    direction: "both"
+    debug_log_mode: "on_change"
+    sub_topic: "/task/heartbeat"
+    pub_topic: "/task/heartbeat"
+    ros_msg: "std_msgs/msg/UInt32"
+    notes: "心跳包。当前 enable_heartbeat=false，调试阶段不会主动使用。"
+    fields:
+      - { proto: "count", type: "u32", ros: "data" }
+
+  - name: "Handshake"
+    id: 0xFF
+    direction: "both"
+    debug_log_mode: "on_change"
+    sub_topic: "/task/handshake"
+    pub_topic: "/task/handshake"
+    ros_msg: "std_msgs/msg/UInt32"
+    notes: "握手包。当前 require_handshake=false，调试阶段不会强制握手。"
+    fields:
+      - { proto: "protocol_hash", type: "u32", ros: "data" }
+
+  # ============================================================
+  # 定位参考：ROS -> MCU (timer-driven, 20Hz)
+  # ============================================================
+
+  - name: "PoseRef"
+    id: 0x12
+    direction: "tx"
+    debug_log_mode: "off"
+    sub_topic: "/serial/pose_ref"
+    ros_msg: "std_msgs/msg/Float32MultiArray"
+    notes: "map->base_link 位姿，20Hz 定时发送，用于下位机 IMU 漂移校正"
+    fields:
+      - { proto: "x_map", type: "f32", ros: "data[0]" }
+      - { proto: "y_map", type: "f32", ros: "data[1]" }
+      - { proto: "yaw_map", type: "f32", ros: "data[2]" }
+  
+
+  # ============================================================
+  # 底盘移动控制：ROS -> MCU
+  # 麦轮底盘建议发送 vx, vy, wz
+  # ============================================================
+
+  - name: "CmdVel"
+    id: 0x01
+    direction: "tx"
+    debug_log_mode: "on_change"
+    reliable: false
+    sub_topic: "/cmd_vel"
+    ros_msg: "geometry_msgs/msg/Twist"
+    notes: "麦轮底盘速度控制：linear.x 前后，linear.y 左右，angular.z 自转角速度。"
+    fields:
+      - { proto: "linear_x",  type: "f32", ros: "linear.x" }
+      - { proto: "linear_y",  type: "f32", ros: "linear.y" }
+      - { proto: "angular_z", type: "f32", ros: "angular.z" }
+
+  # ============================================================
+  # 楼梯/台阶/抓取动作命令：ROS -> MCU
+  # uint8 枚举值映射见 mission_manager.py 中的 ACTION_MAP
+  # ============================================================
+
+  - name: "CamCmd"
+    id: 0x02
+    direction: "tx"
+    debug_log_mode: "on_change"
+    sub_topic: "/camera/view_cmd"
+    ros_msg: "std_msgs/msg/UInt8"
+    notes: "camera_cmd"
+    fields:
+      - { proto: "camaction", type: "u8", ros: "data" }
+
+  - name: "StairActionCmd"
+    id: 0x03
+    direction: "tx"
+    debug_log_mode: "on_change"
+    sub_topic: "/stair_action_cmd"
+    ros_msg: "std_msgs/msg/UInt8"
+    notes: " 1=40cm, 2=20cm, 3=九宫格执行动作, 4=STAIR_DOWN_END"
+    fields:
+      - { proto: "action", type: "u8", ros: "data" }
+      
+  - name: "CamSig"
+    id: 0x04
+    direction: "tx"
+    debug_log_mode: "on_change"
+    sub_topic: "/camera/view_sog"
+    ros_msg: "std_msgs/msg/UInt8"
+    notes: "camera_sig"
+    fields:
+      - { proto: "camsignal", type: "u8", ros: "data" }
+
+#   # qiyucolor2 → area_flag2: 0/1 flag
+#   - name: "AreaFlag2"
+#     id: 0x04
+#     direction: "tx"
+#     debug_log_mode: "on_change"
+#     sub_topic: "area_flag2"
+#     ros_msg: "std_msgs/msg/UInt8"
+#     notes: "qiyucolor2 节点发布。0/1 flag"
+#     fields:
+#       - { proto: "flag2", type: "u8", ros: "data" }
+      
+#  # qiyucolor1 → area_flag1: 0=无, 1=黄色, 2=紫色
+#   - name: "AreaFlag1"
+#     id: 0x05
+#     direction: "tx"
+#     debug_log_mode: "on_change"
+#     sub_topic: "area_flag1"
+#     ros_msg: "std_msgs/msg/UInt8"
+#     notes: "qiyucolor1 节点发布。0=无, 1=黄色, 2=紫色"
+#     fields:
+#       - { proto: "flag1", type: "u8", ros: "data" }
+
+#   # res_kfs → /flag: 0/1 flag
+#   - name: "Flag"
+#     id: 0x06
+#     direction: "tx"
+#     debug_log_mode: "on_change"
+#     sub_topic: "/flag"
+#     ros_msg: "std_msgs/msg/UInt8"
+#     notes: "res_kfs 节点发布。0/1 flag"
+#     fields:
+#       - { proto: "flag", type: "u8", ros: "data" }
