@@ -1,0 +1,163 @@
+import os
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, GroupAction
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from ament_index_python.packages import get_package_share_directory
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    # 获取包的共享目录
+    bring_up_dir = get_package_share_directory('cod_bringup')
+
+    rviz_config_file = os.path.join(bring_up_dir, 'rviz', 'cod_nav.rviz')
+
+    # 声明启动参数
+    declare_use_sim_time = DeclareLaunchArgument(
+        'use_sim_time', default_value='false',
+        description='Use simulation (Gazebo) clock if true')
+    declare_slam_params_file = DeclareLaunchArgument(
+        'slam_params_file', default_value=os.path.join(bring_up_dir,'params','mapper_params_online_async.yaml')
+    )
+    declare_nav2_params_file = DeclareLaunchArgument(
+        'nav2_params_file',default_value=os.path.join(bring_up_dir,'params','multiplenav2_params.yaml')
+    )
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    slam_params_file = LaunchConfiguration('slam_params_file')
+    nav2_params_file = LaunchConfiguration('nav2_params_file')
+
+    # 定义节点和包含的launch文件
+    load_nodes = GroupAction(
+        actions=[
+            Node(
+                package='cpp_lidar_filter',
+                executable='lidar_filter_node',
+                name='my_lidar_filter',
+                output='screen',
+                parameters=[{
+                    'input_topic': '/livox/lidar/pointcloud',  # 输入点云话题
+                    'output_topic': '/livox/lidar_filtered',
+                    'min_x': -0.65, 'max_x': 0.03,
+                    'min_y': -0.38, 'max_y': 0.33,
+                    'min_z': -0.35, 'max_z': 0.50,
+                    'negative': True,   # 挖掉车身
+                    'leaf_size': 0.05   # 降采样
+                }]
+            ),
+            Node(
+                    package="small_point_lio",
+                    executable="small_point_lio_node",
+                    name="small_point_lio",
+                    output="screen",
+                    parameters=[
+                        PathJoinSubstitution(
+                            [
+                                FindPackageShare("small_point_lio"),
+                                "config",
+                                "mid360.yaml",
+                            ]
+                        )
+                    ],
+            ),
+            Node(
+                package='pointcloud_to_laserscan',
+                executable='pointcloud_to_laserscan_node',
+                remappings=[
+                    ('cloud_in',  '/livox/lidar_filtered'),
+                    ('scan', '/scan')
+                ],
+                parameters=[{
+                    'target_frame': 'base_link',
+                    'transform_tolerance': 0.5,
+                    'min_height': 0.10,
+                    'max_height': 1.00,
+                    'angle_min': -3.1416,
+                    'angle_max': 3.1416,
+                    'angle_increment': 0.0087,
+                    'scan_time': 0.3333,
+                    'range_min': 0.5,
+                    'range_max': 20.0,
+                    'use_inf': True,
+                    'inf_epsilon': 1.0
+                }],
+                name='pointcloud_to_laserscan'
+            ),
+            Node(
+                package='slam_toolbox',
+                executable='async_slam_toolbox_node',
+                name='slam_toolbox',
+                output='screen',
+                parameters=[
+                    slam_params_file,
+                    {'use_sim_time': use_sim_time}
+                ],
+            ),
+            Node(
+                package="tf2_ros",
+                executable="static_transform_publisher",
+                arguments=[
+                    "--x",
+                    "0.0",
+                    "--y",
+                    "0.0",
+                    "--z",
+                    "0.05",
+                    "--roll",
+                    "0.0",
+                    "--pitch",
+                    "0.0",
+                    "--yaw",
+                    "0.0",
+                    "--frame-id",
+                    "map",
+                    "--child-frame-id",
+                    "odom",
+                ],
+            ),
+
+            # Realsense 暂时不启动
+            # IncludeLaunchDescription(
+            #     PythonLaunchDescriptionSource(
+            #         os.path.join(get_package_share_directory('realsense2_camera'),'launch','rs_launch.py')
+            #     ),
+            #     launch_arguments={
+            #         'depth_module.depth_profile': '1280x720x30',
+            #         'pointcloud.enable': 'true'
+            #     }.items()
+            # ),
+
+            # Nav2 导航核心
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(bring_up_dir,'launch','navigation_launch.py')),
+                launch_arguments={
+                                  'use_sim_time': "false",
+                                  'autostart': "true",
+                                  'params_file': nav2_params_file,
+                                  'use_composition': 'False',
+                                  'use_respawn': 'False',
+                                  'container_name': 'nav2_container'}.items()
+            ),
+
+            Node(
+                package='rviz2',
+                executable='rviz2',
+                arguments=['-d',rviz_config_file],
+                output='screen',
+            ),
+            IncludeLaunchDescription(
+                   PythonLaunchDescriptionSource(
+                   os.path.join(get_package_share_directory('cod_bringup'), 'launch', 'auto_save_map.launch.py')
+            )
+          )
+        ]
+    )
+
+    return LaunchDescription([
+        declare_use_sim_time,
+        declare_slam_params_file,
+        declare_nav2_params_file,
+        load_nodes
+    ])

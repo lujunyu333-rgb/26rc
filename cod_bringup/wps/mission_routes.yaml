@@ -1,0 +1,121 @@
+routes:
+  test_stair:
+    segments:
+      - name: stair_1_up
+        nav_goal:
+          x: 6.0
+          y: -1.56
+          yaw: 0.0
+        trigger:
+          enabled: true
+          x: 5.012392520904541
+          y: -1.563098669052124
+          yaw: 0.0
+          radius: 0.6
+          yaw_tolerance: 0.52
+          action: "STAIR_UP_START"
+        on_reached_action: "STAIR_UP_END"
+      - name: stair_2_up
+        nav_goal:
+          x: 7.0
+          y: -1.56
+          yaw: 0.0
+        trigger:
+          enabled: true
+          x: 6.5
+          y: -1.56
+          yaw: 0.0
+          radius: 0.6
+          yaw_tolerance: 0.52
+          action: "STAIR_UP_START"
+        on_reached_action: "STAIR_UP_END"
+      - name: stair_down
+        nav_goal:
+          x: 8.0
+          y: -1.56
+          yaw: 0.0
+        trigger:
+          enabled: true
+          x: 7.5
+          y: -1.56
+          yaw: 0.0
+          radius: 0.6
+          yaw_tolerance: 0.52
+          action: "STAIR_DOWN_START"
+        on_reached_action: "STAIR_DOWN_END"
+
+  fixed_5_points:
+    segments:
+      - name: point_01
+        nav_goal:
+          x: 1.011
+          y: -4.680
+          yaw: -1.575
+      - name: point_02
+        nav_goal:
+          x: 2.338
+          y: -2.305
+          yaw: -0.014
+      - name: point_03
+        nav_goal:
+          x: 3.527
+          y: -2.344
+          yaw: -0.007
+      - name: point_04
+        nav_goal:
+          x: 4.767
+          y: -2.377
+          yaw: 0.002
+      - name: point_05
+        nav_goal:
+          x: 5.985
+          y: -2.400
+          yaw: -0.037
+
+  blue_mission:
+    segments:
+      - name: blue1
+        nav_goal:
+          x: 0.3970
+          y: -4.6461
+          yaw: -1.6174
+      - name: blue2
+        nav_goal:
+          x: 1.2140
+          y: -2.2464
+          yaw: 0.0100
+      - name: blue3
+        nav_goal:
+          x: 2.6088
+          y: -2.2342
+          yaw: -0.0168
+      - name: blue4
+        nav_goal:
+          x: 3.8368
+          y: -2.2361
+          yaw: -0.0006
+      - name: blue5
+        nav_goal:
+          x: 5.0782
+          y: -2.2843
+          yaw: 0.0177
+      - name: blue6
+        nav_goal:
+          x: 6.1483
+          y: -2.3877
+          yaw: 1.5866
+      - name: blue7
+        nav_goal:
+          x: 6.2907
+          y: -1.1124
+          yaw: 0.0284
+      - name: blue8
+        nav_goal:
+          x: 7.4414
+          y: -1.1855
+          yaw: 0.0066
+      - name: blue9
+        nav_goal:
+          x: 9.5982
+          y: -4.6126
+          yaw: -1.5626

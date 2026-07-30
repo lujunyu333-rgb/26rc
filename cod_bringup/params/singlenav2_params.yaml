@@ -1,0 +1,449 @@
+bt_navigator:
+  ros__parameters:
+    use_sim_time: false
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: Odometry
+    bt_loop_duration: 10
+    timeout: 100
+    wait_for_service_timeout: 1000
+    #default_nav_to_pose_bt_xml: $(find-pkg-share nav2_bt_navigator)/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml
+    default_nav_to_pose_bt_xml: $(find-pkg-share cod_bringup)/behavior_trees/navigate_to_pose_w_replanning_and_recovery.xml
+    default_nav_through_poses_bt_xml: $(find-pkg-share cod_bringup)/behavior_trees/navigate_through_poses_w_replanning_and_recovery.xml
+
+    #default_nav_through_poses_bt_xml: $(find-pkg-share nav2_bt_navigator)/behavior_trees/navigate_through_poses_w_replanning_and_recovery.xml
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_assisted_teleop_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_truncate_path_local_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_assisted_teleop_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
+      - nav2_is_battery_charging_condition_bt_node
+controller_server:
+  ros__parameters:
+    publish_critics_stats: True
+    use_sim_time: False
+    # 控制频率 60Hz（原50Hz）。麦轮底盘响应快，小幅提高让路径跟踪和近目标修正更细。
+    # 注意：需配套提高 velocity_smoother 的 smoothing_frequency。
+    controller_frequency: 60.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"] # "precise_goal_checker"
+    controller_plugins: ["FollowPath"]
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.1
+      movement_time_allowance: 999.0
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      # 到点位置容差 0.045m。
+      xy_goal_tolerance: 0.04
+      # 到点角度容差 0.10rad≈5.7°（原0.07rad≈4°）。减少到点后反复转向微调。
+      yaw_goal_tolerance: 0.05
+    # ===== old MPPI / goal_approach_controller backup =====
+    # FollowPath:
+    #   plugin: "goal_approach_controller::GoalApproachController"
+    #   inner_plugin: "nav2_mppi_controller::MPPIController"
+    #   ... (MPPI critics & params preserved for rollback)
+    # ===== end MPPI backup =====
+
+    FollowPath:
+      plugin: "pb_omni_pid_pursuit_controller::OmniPidPursuitController"
+
+      # 路径前视距离 0.60m（原0.40m）。看更远，转弯更提前更平缓。
+      # 巡航≈kp×lookahead=2.0×0.60=1.20m/s。如果切内角：降到 0.50。
+      lookahead_dist: 0.5
+      use_velocity_scaled_lookahead_dist: false
+      use_interpolation: false
+
+      # 平移 P 增益 2.17。巡航速度≈kp×lookahead=2.17×0.60≈1.30m/s。
+      # kp 降低 + lookahead 加大 = 同速但转弯更平缓。如果慢：升到 2.3。
+      translation_kp: 2.17
+      translation_ki: 0.0
+      # 平移 D 增益 0.15（原0.1）。kp 加大后用 D 压制过冲和回调。
+      # 如果仍冲：加到 0.20。如果速度忽大忽小或抖动：降回 0.10。
+      translation_kd: 0.15
+
+      enable_rotation: true
+      # 旋转 P 增益 2.5（原2.0）。转弯柔和，边走边转不抢。
+      rotation_kp: 2.5
+      rotation_ki: 0.0
+      rotation_kd: 0.1
+      use_rotate_to_heading: false
+
+      # 近目标减速起始距离 0.80m（原0.35m）。拉长减速距离，给麦轮充分刹车时间。
+      # 如果到点太慢影响效率：降到 0.50~0.60。如果仍冲：加到 1.00。
+      approach_velocity_scaling_dist: 0.80
+      # 近目标最低线速度 0.50m/s。距目标 0.80m 开始减速至 0.50。
+      min_approach_linear_velocity: 0.50
+      v_linear_max: 10.0
+      v_linear_min: -10.0
+      # 角速度上限 2.0rad/s≈115°/s（原1.4）。留足够旋转空间，配合 kp=4.0。
+      # 如果甩头/摆头：降回 1.6。
+      v_angular_max: 2.0
+      v_angular_min: -2.0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 20.0
+      publish_frequency: 20.0
+      global_frame: odom
+      robot_base_frame: base_link
+      use_sim_time: False
+      rolling_window: true
+      width: 10 
+      height: 10
+      resolution: 0.05
+      robot_radius: 0.1
+      footprint: "[ [0.1, 0.1], [0.1, -0.1], [-0.1, -0.1], [-0.1, 0.1] ]"
+      # 雷达动态点云避障已关闭：只保留静态地图层 + 膨胀层
+      # 如需恢复 Livox 点云避障，改回：["static_layer","stvl_voxel_layer","inflation_layer"]，并取消下面 stvl_voxel_layer 注释
+      plugins: ["static_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 5.0 #关键修正！原0.3衰减太慢，整个膨胀区代价都极高，MPPI没有梯度可用。5.0让代价快速衰减，形成清晰的"远离障碍物"梯度
+        inflation_radius: 0.30
+      # ---------------- 雷达点云动态避障层 STVL 已注释开始 ----------------
+      # stvl_voxel_layer:
+      #   plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
+      #   enabled: true
+      #   voxel_decay: 0.5     #seconds if linear, e^n if exponential
+      #   decay_model: 0      #0=linear, 1=exponential, 2=persistent
+      #   voxel_size: 0.05   #meters
+      #   track_unknown_space: true   #default space is unknown
+      #   observation_persistence: 0.0  #seconds
+      #   max_obstacle_height: 2.0    #meters
+      #   mark_threshold: 0      #voxel height
+      #   update_footprint_enabled: true
+      #   combination_method: 1      #1=max, 0=override
+      #   obstacle_range: 3.0    #meters
+      #   origin_z: 0.0    #meters
+      #   publish_voxel_map: false   # default off
+      #   transform_tolerance: 0.2    # seconds
+      #   mapping_mode: false  # default off, saves map not for navigation
+      #   map_save_duration: 60.0     #default 60s, how often to autosave
+      #   observation_sources: livox_source
+      #   livox_source:
+      #     data_type: PointCloud2
+      #     topic:  /livox/lidar_filtered
+      #     transport_type: "raw"        #default raw -No compression-, Options: zlib, draco, zstd
+      #     marking: true
+      #     clearing: true
+
+      #     obstacle_range: 8.0
+      #     raytrace_range: 9.0
+
+      #     min_obstacle_height: 0.15     #default 0, meters
+      #     max_obstacle_height: 1.0     #defaule 3, meters
+      #     expected_update_rate: 0.0    #default 0, if not updating at this rate at least, remove from buffer
+      #     observation_persistence: 0.0 #default 0, use all measurements taken during now-value, 0=latest
+      #     inf_is_valid: false          #default false, for laser scans
+      #     clear_after_reading: true    #default false, clear the buffer after the layer gets readings from it
+      #     filter: "voxel"              #default passthrough, apply "voxel", "passthrough", or no filter to sensor data, recommended to have at one filter on
+      #     voxel_min_points: 0          #default 0, minimum points per voxel for voxel filter
+      #     model_type: 1
+      #     vertical_fov_angle: 2.00      #default 0.7, radians
+      #     vertical_fov_offset: 0.0
+      #     horizontal_fov_angle: 6.28
+      #   # realsense_source:
+      #     # enabled: true
+      #     # data_type: PointCloud2
+      #     # topic: /camera/camera/depth/color/points
+      #     # transport_type: "raw"
+      #     # marking: true
+      #     # clearing: true
+      #     # obstacle_range: 3.0          #meters, 424x240低分辨率有效探测距离
+      #     # raytrace_range: 3.5          #meters, 清除射线范围略大于obstacle_range
+      #     # min_z: 0.15                  #meters, 过滤地面
+      #     # max_z: 3.5                   #meters, 低分辨率超过3.5m精度差
+      #     # min_obstacle_height: 0.18    #meters, 最低障碍物高度
+      #     # max_obstacle_height: 1.5     #meters, 哨兵高度以上不关心
+      #     # #expected_update_rate: 15.0    #相机掉线时及时告警
+      #     # clear_after_reading: true    #高频输入及时清除缓冲
+      #     # filter: "voxel"              #降采样减少处理量
+      #     # voxel_min_points: 0
+      #     # vertical_fov_angle: 1.01     #D435i垂直FOV 58° ≈ 1.01 rad
+      #     # vertical_fov_offset: 0.0
+      #     # horizontal_fov_angle: 1.52   #D435i水平FOV 87° ≈ 1.52 rad
+      #     # decay_acceleration: 1.
+      #     # model_type: 0                #depth camera
+      # ---------------- 雷达点云动态避障层 STVL 已注释结束 ----------------
+      always_send_full_costmap: False
+
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      width: 25
+      height: 25
+      update_frequency: 20.0
+      publish_frequency: 20.0
+      global_frame: map
+      robot_base_frame: base_link
+      rolling_window: true
+      use_sim_time: False
+      robot_radius: 0.1
+      footprint: "[ [0.1, 0.1], [0.1, -0.1], [-0.1, -0.1], [-0.1, 0.1] ]"
+      resolution: 0.04
+      track_unknown_space: true
+      # 雷达动态点云避障已关闭：只保留静态地图层 + 膨胀层
+      # 如需恢复 Livox 点云避障，改回：["static_layer","stvl_voxel_layer","inflation_layer"]，并取消下面 stvl_voxel_layer 注释
+      plugins: ["static_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+        enable: true
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 5.0 #与local_costmap一致
+        inflation_radius: 0.40
+      # ---------------- 雷达点云动态避障层 STVL 已注释开始 ----------------
+      # stvl_voxel_layer:
+      #   plugin: "spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer"
+      #   enabled: true
+      #   voxel_decay: 0.5     #seconds if linear, e^n if exponential
+      #   decay_model: 0      #0=linear, 1=exponential, 2=persistent
+      #   voxel_size: 0.05   #meters
+      #   track_unknown_space: true   #default space is unknown
+      #   observation_persistence: 0.0  #seconds
+      #   max_obstacle_height: 2.0    #meters
+      #   mark_threshold: 0      #voxel height
+      #   update_footprint_enabled: true
+      #   combination_method: 1      #1=max, 0=override
+      #   obstacle_range: 3.0    #meters
+      #   origin_z: 0.0    #meters
+      #   publish_voxel_map: false   # default off
+      #   transform_tolerance: 0.2    # seconds
+      #   mapping_mode: false  # default off, saves map not for navigation
+      #   map_save_duration: 60.0     #default 60s, how often to autosave
+      #   observation_sources: livox_source
+      #   livox_source:
+      #     data_type: PointCloud2
+      #     topic:  /livox/lidar_filtered
+      #     transport_type: "raw"        #default raw -No compression-, Options: zlib, draco, zstd
+      #     marking: true
+      #     clearing: true
+
+      #     obstacle_range: 8.0
+      #     raytrace_range: 9.0
+
+      #     min_obstacle_height: 0.15     #default 0, meters
+      #     max_obstacle_height: 1.0     #defaule 3, meters
+      #     expected_update_rate: 0.0    #default 0, if not updating at this rate at least, remove from buffer
+      #     observation_persistence: 0.0 #default 0, use all measurements taken during now-value, 0=latest
+      #     inf_is_valid: false          #default false, for laser scans
+      #     clear_after_reading: true    #default false, clear the buffer after the layer gets readings from it
+      #     filter: "voxel"              #default passthrough, apply "voxel", "passthrough", or no filter to sensor data, recommended to have at one filter on
+      #     voxel_min_points: 0          #default 0, minimum points per voxel for voxel filter
+      #     model_type: 1
+      #     vertical_fov_angle: 2.00      #default 0.7, radians
+      #     vertical_fov_offset: 0.0
+      #     horizontal_fov_angle: 6.28
+      #   # realsense_source:
+      #     # enabled: true
+      #     # data_type: PointCloud2
+      #     # topic: /camera/camera/depth/color/points
+      #     # transport_type: "raw"
+      #     # marking: true
+      #     # clearing: true
+      #     # obstacle_range: 3.0
+      #     # raytrace_range: 3.5
+      #     # min_z: 0.15
+      #     # max_z: 3.5
+      #     # min_obstacle_height: 0.18
+      #     # max_obstacle_height: 1.5
+      #     # #expected_update_rate: 15.0    #相机掉线时及时告警
+      #     # clear_after_reading: true
+      #     # filter: "voxel"
+      #     # voxel_min_points: 0
+      #     # vertical_fov_angle: 1.01     #D435i垂直FOV 58° ≈ 1.01 rad
+      #     # vertical_fov_offset: 0.0
+      #     # horizontal_fov_angle: 1.52   #D435i水平FOV 87° ≈ 1.52 rad
+      #     # decay_acceleration: 1.
+      #     # model_type: 0
+      # ---------------- 雷达点云动态避障层 STVL 已注释结束 ----------------
+      always_send_full_costmap: False
+
+map_server:
+  ros__parameters:
+    use_sim_time: False
+    # Overridden in launch by the "map" launch configuration or provided default value.
+    # To use in yaml, remove the default "map" value in the tb3_simulation_launch.py file & provide full path to map below.
+    yaml_filename: "/home/lyu/COD26/cod_-rm2026_-navigation/src/cod_bringup/maps/2026rc.yaml"
+
+map_saver:
+  ros__parameters:
+    use_sim_time: False
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: True
+
+planner_server:
+  ros__parameters:
+    use_sim_time: false
+    expected_planner_frequency: 10.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_smac_planner/SmacPlanner2D"
+      tolerance: 0.5                      # 如果无法到达精确位置的规划容差，单位：米
+      allow_unknown: true                 # 允许在未知空间中行驶
+      downsample_costmap: false           # 是否对地图进行下采样
+      downsampling_factor: 1              # 代价地图层分辨率的倍数 (e.g. 2 on a 5cm costmap would be 10cm)
+      max_iterations: 1000000             # 搜索的最大总迭代次数（如果无法到达），设置为-1以禁用
+      max_on_approach_iterations: 1000    # 一旦在容差范围内，尝试到达目标的最大迭代次数
+      max_planning_time: 4.5              # 规划、平滑和上采样的最大时间（秒）。将根据规划后的剩余时间缩放最大平滑和上采样时间。
+      cost_travel_multiplier: 4.0         # For 2D: 应用于搜索的代价乘数，以避开高代价区域。较大的值将更精确地放置在通道的中心（如果存在非“FREE”代价势场），但计算时间稍长。为了优化速度，1.0是合理的值。合理的折衷值是2.0。0.0的值有效地禁用避开障碍物的功能，像一个简单的二进制搜索A*。
+      motion_model_for_search: "DUBIN"    # For Hybrid Dubin, Redds-Shepp
+      angle_quantization_bins: 72         # For Hybrid nodes: 搜索的角度桶数，对于2D节点必须为1（无角度搜索）
+      analytic_expansion_ratio: 3.5       # For Hybrid/Lattice nodes: 在搜索过程中尝试解析扩展的比例，用于最终接近。
+      analytic_expansion_max_length: 3.0  # For Hybrid/Lattice nodes: 解析扩展被认为有效的最大长度，以防止不安全的捷径（单位：米）。这应该与最小转弯半径成比例，不应小于最小半径的4-5倍。
+      minimum_turning_radius: 0.05        # For Hybrid/Lattice nodes: 路径/车辆的最小转弯半径，单位：米
+      retrospective_penalty: 0.025        # For Hybrid/Lattice nodes: 优先考虑路径上较晚的机动而不是较早的机动。节省搜索时间，因为较早的节点不会被扩展，直到有必要。必须 >= 0.0且 <= 1.0
+      reverse_penalty: 1.0                # For Reeds-Shepp model: 应用于倒车的惩罚，必须 >= 1
+      change_penalty: 0.0                 # For Hybrid nodes: 应用于改变方向的惩罚，必须 >= 0
+      non_straight_penalty: 0.0          # For Hybrid nodes: 应用于非直线运动的惩罚，必须 >= 1
+      cost_penalty: 2.0                   # For Hybrid nodes: 在将更高代价区域添加到障碍物地图动态规划距离扩展启发式时应用的惩罚。这将驱动机器人更靠近通道的中心。1.3 - 3.5 之间的值是合理的。
+      lookup_table_size: 20.0             # For Hybrid nodes: 缓存的dubin/reeds-sheep距离窗口的大小，单位：米。
+      cache_obstacle_heuristic: True      # For Hybrid nodes: 在同一目标位置的后续重新规划之间缓存障碍物地图动态规划距离扩展启发式。如果代价地图基本静态，则显著加快重新规划性能（40倍）。
+      allow_reverse_expansion: True      # For Lattice node: 是否在前向原语或反向扩展状态格子图中扩展，将使每一步的分支因子加倍。
+      smooth_path: True                   # For Lattice/Hybrid nodes: 是否平滑路径，对于2D节点始终为 true。
+      smoother:
+        max_iterations: 10000
+        w_smooth: 0.4
+        w_data: 0.1
+        tolerance: 1.0e-10
+        do_refinement: true
+
+smoother_server:
+  ros__parameters:
+    costmap_topic: global_costmap/costmap_raw
+    footprint_topic: global_costmap/published_footprint
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+    smoother_plugins: ["savitzky_golay_smoother"]
+    savitzky_golay_smoother:
+      plugin: "nav2_smoother::SavitzkyGolaySmoother"
+      window_size: 7
+      poly_order: 3
+      do_refinement: True
+      refinement_num: 2
+      enforce_path_inversion: True
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: false
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
+    spin:
+        plugin: "nav2_behaviors/Spin"
+    backup:
+        plugin: "pb_nav2_behaviors/BackUpFreeSpace"
+    drive_on_heading:
+        plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+        plugin: "nav2_behaviors/Wait"
+    assisted_teleop:
+        plugin: "nav2_behaviors/AssistedTeleop"
+    local_frame: odom
+    global_frame: map
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 1.4
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 3.2
+    # params for pb_nav2_behaviors/BackUpFreeSpace
+    robot_radius: 0.1
+    max_radius: 3.5
+    service_name: "global_costmap/get_costmap"
+    free_threshold: 5
+    visualize: True
+
+robot_state_publisher:
+  ros__parameters:
+    use_sim_time: False
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: False
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
+
+velocity_smoother:
+  ros__parameters:
+    # 平滑器输出频率 50Hz（原30Hz）。配合 controller_frequency 60Hz，让 /cmd_vel 更细。
+    # 如果串口压力大或下位机响应异常：降回 30Hz 或 40Hz。
+    smoothing_frequency: 50.0
+    # 超速时等比例缩放 vx/vy/wz（原False=分轴裁剪）。麦轮全向运动中分轴裁剪可能改变方向。
+    # 配合 max_velocity 从 [6,6,3] 降到 [2,2,1.8]。如果转弯时线速度被压太多：改回 False。
+    scale_velocities: True
+    feedback: "OPEN_LOOP"
+    # 最终 /cmd_vel 上限 [2.0, 2.0, 1.8] m/s（原[6,6,3]）。
+    # 正常巡航约1.2m/s不受影响，但截断路径突变/定位跳变时的速度尖峰。
+    max_velocity: [2.0, 2.0, 1.8]
+    min_velocity: [-2.0, -2.0, -1.8]
+    deadband_velocity: [0.05, 0.05, 0.05]
+    velocity_timeout: 1.0
+    max_accel: [6.0, 6.0, 3.0] #与 MPPI 加速度一致
+    max_decel: [-6.0, -6.0, -3.0] #与 MPPI 制动一致
+    odom_topic: "Odometry"
+    odom_duration: 0.1
